@@ -8,6 +8,14 @@
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
+
+import sys
+sys.path.append('/cbica/home/gangarav/projects/rsna_lumbar/src')
+from torch.utils.data import IterableDataset, DataLoader
+import zarr
+import pandas as pd
+import random
+
 import argparse
 import datetime
 import json
@@ -134,6 +142,105 @@ def get_args_parser():
     return parser
 
 
+###############
+
+class TrainDataset(IterableDataset):
+    def __init__(self, mini_batch_size=10, fixed_shape=(1, 128, 128), local_normalize=True, real_world_pos=False, n_workers=4):
+        self.num_batches = int(100000/n_workers)
+        self.mini_batch_size = mini_batch_size
+        self.fixed_shape = fixed_shape
+        self.local_normalize = local_normalize
+        self.real_world_pos = real_world_pos
+        self.series_metadata = pd.read_pickle('/cbica/home/gangarav/projects/rsna_lumbar/well_formed_axials_with_metadata.pkl')
+    
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            z, x, y = self.fixed_shape
+            batch = []
+
+            for _ in range(self.mini_batch_size):
+
+                zarr_ref = None
+                enough_frames = False
+                while not enough_frames:
+                    # choose a random row from series_metadata
+                    row = self.series_metadata.sample().iloc[0]
+                    series_path = f"/cbica/home/gangarav/rsna24_preprocessed/{row['series']}.zarr"
+                    enough_frames = self._enough_dims_in_series_shape(row["shape"], (z, x, y))
+
+                    if not enough_frames:
+                        continue
+
+                    zarr_ref = self._get_zarr_reference(series_path)
+
+                    slice_indices_1 = self._get_frame_indices_for_series_shape_and_slice_shape(row["shape"], (z, x, y))
+                    slices_1 = self._get_frames_from_zarr_reference(zarr_ref, row["mean"], row["std"], slice_indices_1, local_normalize=self.local_normalize)
+                    slices_1 = slices_1.squeeze(0)
+                    
+                if self.real_world_pos:
+                    px_to_world = np.array([row["z_spacing"], row["x_spacing"], row["y_spacing"]])
+                else:
+                    px_to_world = np.array([1.0, 1.0, 1.0])
+
+                batch.append((slices_1, px_to_world))
+
+            yield tuple(np.stack(t) for t in zip(*batch))
+
+    def _choose_three_numbers_sum_to_16(self):
+        x = random.randint(7, 8)
+        y = random.randint(7, 8)
+        z = random.randint(0, 16 - x - y)
+        b = 16 - x - y - z
+        return 2**z, 2**x, 2**y, 2**b
+
+    def _get_list_of_valid_studies(self):
+        # Implement logic to get the list of valid studies
+        pass
+
+    def _get_zarr_reference(self, series_path):
+        return zarr.open(series_path, mode='r')
+
+    def _get_frames_from_zarr_reference(self, zarr, series_mean, series_std, slice_list=None, local_normalize=False):
+        if slice_list is not None:
+            slices = tuple(slice(start, end) for start, end in slice_list)
+            z = zarr[slices]
+        else:
+            z = zarr[:]
+        
+        if local_normalize:
+            try:
+                std = np.std(z)
+            except:
+                std = 1.0
+                print("stdev is 0, not dividing by stdev")
+            z = (z - np.mean(z))/std
+        else:
+            z = (z - series_mean)/series_std
+
+        return np.expand_dims(z, axis=0)
+
+    def _get_frame_indices_for_series_shape_and_slice_shape(self, series_shape, slice_shape):
+        slice_indices = []
+        for axis, size in enumerate(series_shape):
+            if size < slice_shape[axis]:
+                return None
+            else:
+                index = random.randint(0, size - slice_shape[axis])
+                slice_indices.append([index, index + slice_shape[axis]])
+        return slice_indices
+
+    def _enough_dims_in_series_shape(self, series_shape, slice_shape):
+        for axis, size in enumerate(series_shape):
+            if size < slice_shape[axis]:
+                return False
+        return True
+
+###############
+
+
 def main(args):
     misc.init_distributed_mode(args)
 
@@ -152,25 +259,33 @@ def main(args):
     handle_flash_attn(args)
 
     # simple augmentation
-    transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    # transform_train = transforms.Compose([
+    #         transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # print(dataset_train)
+    dataset_train = TrainDataset(
+        mini_batch_size=args.batch_size,
+        fixed_shape=(1, 128, 128),
+        local_normalize=True,
+        real_world_pos=False,
+        n_workers=args.num_workers
+    )
 
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print("Sampler_train = %s" % str(sampler_train))
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_dir is not None:
+    # if args.distributed:
+    #     num_tasks = misc.get_world_size()
+    #     global_rank = misc.get_rank()
+    #     sampler_train = torch.utils.data.DistributedSampler(
+    #         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    #     )
+    #     print("Sampler_train = %s" % str(sampler_train))
+    # else:
+    #     sampler_train = torch.utils.data.RandomSampler(dataset_train)
+
+    if args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
@@ -178,13 +293,18 @@ def main(args):
 
     dataloader_cls = MultiEpochsDataLoader if args.multi_epochs_dataloader else torch.utils.data.DataLoader
 
-    data_loader_train = dataloader_cls(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
+
+    data_loader_train = DataLoader(dataset_train, batch_size=None, num_workers=4)
+    
+
+
+    # data_loader_train = dataloader_cls(
+    #     dataset_train, sampler=sampler_train,
+    #     batch_size=args.batch_size,
+    #     num_workers=args.num_workers,
+    #     pin_memory=args.pin_mem,
+    #     drop_last=True,
+    # )
     
     # define the model
     if args.cross_mae:
